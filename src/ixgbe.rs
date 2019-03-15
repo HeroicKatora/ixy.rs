@@ -71,6 +71,19 @@ fn wrap_ring(index: usize, ring_size: usize) -> usize {
     (index + 1) & (ring_size - 1)
 }
 
+/// Split a ring of `size` into two slices totaling `len`.
+///
+/// The first range describes the slice beginning at `start` while the second begins at `0`.
+#[inline(always)]
+fn split_ring(start: usize, len: usize, size: usize) -> (usize, usize) {
+    assert!(start < size);
+    assert!(len < size);
+    let remaining = size - start;
+    let first = remaining.min(len);
+    let contin = len - first;
+    (first, contin)
+}
+
 pub struct IxgbeDevice {
     pci_addr: String,
     addr: *mut u8,
@@ -89,6 +102,13 @@ struct IxgbeRxQueue {
     pool: Rc<Mempool>,
     bufs_in_use: Vec<usize>,
     rx_index: usize,
+}
+
+struct RxEntry<'a> {
+    index: usize,
+    descriptor: &'a mut ixgbe_adv_rx_desc,
+    buf_in_use: &'a mut usize,
+    pool: &'a Rc<Mempool>,
 }
 
 struct IxgbeTxQueue {
@@ -191,70 +211,168 @@ impl IxyDevice for IxgbeDevice {
         buffer: &mut VecDeque<Packet>,
         num_packets: usize,
     ) -> usize {
-        let mut rx_index;
-        let mut last_rx_index;
-        let mut received_packets = 0;
+        let previous_len = buffer.len();
+        let new_queue_state;
 
         {
             let queue = &mut self.rx_queues[queue_id as usize];
 
-            rx_index = queue.rx_index;
-            last_rx_index = queue.rx_index;
+            // Try to iterate over all possible packet, until one fails. Record the index of the
+            // last packet which was inspected.
+            let new_read_buffer = queue.prepare_send(num_packets).try_fold(None, |previous, entry| {
+                let RxEntry { index, descriptor, buf_in_use, pool } = entry;
 
-            for i in 0..num_packets {
-                let desc = unsafe { queue.descriptors.add(rx_index) as *mut ixgbe_adv_rx_desc };
-                let status =
-                    unsafe { ptr::read_volatile(&mut (*desc).wb.upper.status_error as *mut u32) };
+                let status = unsafe {
+                    ptr::read_volatile(&mut (*descriptor).wb.upper.status_error as *mut u32) 
+                };
 
-                if (status & IXGBE_RXDADV_STAT_DD) != 0 {
-                    if (status & IXGBE_RXDADV_STAT_EOP) == 0 {
-                        panic!("increase buffer size or decrease MTU")
-                    }
-
-                    let pool = &queue.pool;
-
-                    // get a free buffer from the mempool
-                    let buf = pool.alloc_buf().expect("no buffer available");
-
-                    // replace currently used buffer with new buffer
-                    let buf = mem::replace(&mut queue.bufs_in_use[rx_index], buf);
-
-                    let p = unsafe {
-                        Packet {
-                            addr_virt: pool.get_virt_addr(buf),
-                            addr_phys: pool.get_phys_addr(buf),
-                            len: ptr::read_volatile(&(*desc).wb.upper.length as *const u16)
-                                as usize,
-                            pool: pool.clone(),
-                            pool_entry: buf,
-                        }
-                    };
-
-                    buffer.push_back(p);
-
-                    unsafe {
-                        ptr::write_volatile(
-                            &mut (*desc).read.pkt_addr as *mut u64,
-                            pool.get_phys_addr(queue.bufs_in_use[rx_index]) as u64,
-                        );
-                        ptr::write_volatile(&mut (*desc).read.hdr_addr as *mut u64, 0);
-                    }
-
-                    last_rx_index = rx_index;
-                    rx_index = wrap_ring(rx_index, queue.num_descriptors);
-                    received_packets = i + 1;
-                } else {
-                    break;
+                if (status & IXGBE_RXDADV_STAT_DD) == 0 {
+                    return Err(previous);
                 }
-            }
+
+                if (status & IXGBE_RXDADV_STAT_EOP) == 0 {
+                    panic!("increase buffer size or decrease MTU")
+                }
+
+                // get a free buffer from the mempool
+                let buf = pool.alloc_buf().expect("no buffer available");
+
+                // replace currently used buffer with new buffer
+                let newbuf = mem::replace(buf_in_use, buf);
+
+                let p = unsafe {
+                    Packet {
+                        addr_virt: pool.get_virt_addr(newbuf),
+                        addr_phys: pool.get_phys_addr(newbuf),
+                        len: ptr::read_volatile(&(*descriptor).wb.upper.length as *const u16)
+                            as usize,
+                        pool: pool.clone(),
+                        pool_entry: newbuf,
+                    }
+                };
+
+                buffer.push_back(p);
+
+                unsafe {
+                    ptr::write_volatile(
+                        &mut (*descriptor).read.pkt_addr as *mut u64,
+                        pool.get_phys_addr(*buf_in_use) as u64,
+                    );
+                    ptr::write_volatile(&mut (*descriptor).read.hdr_addr as *mut u64, 0);
+                }
+
+                Ok(Some(index))
+            });
+
+            // Error was used for loop termination, still holds the required value.
+            new_queue_state = new_read_buffer
+                .unwrap_or_else(|new| new)
+                .map(|queue_index| {
+                    let rx_index = wrap_ring(queue_index, queue.num_descriptors);
+                    (rx_index, queue_index)
+                });
         }
 
-        if rx_index != last_rx_index {
-            self.set_reg32(IXGBE_RDT(queue_id), last_rx_index as u32);
+        if let Some((rx_index, queue_index)) = new_queue_state {
+            self.set_reg32(IXGBE_RDT(queue_id), queue_index as u32);
             self.rx_queues[queue_id as usize].rx_index = rx_index;
         }
 
-        received_packets
+        buffer.len() - previous_len
+    }
+
+    fn rx_trade(
+        &mut self,
+        queue_id: u32,
+        buffer: &mut VecDeque<Packet>,
+        num_packets: usize,
+    ) -> usize {
+        let from_buffer = buffer.len().min(num_packets);
+        let from_pool = num_packets - from_buffer;
+
+        let new_queue_state;
+
+        {
+            let queue = &mut self.rx_queues[queue_id as usize];
+
+            // Try to iterate over all possible packet, until one fails. Record the index of the
+            // last packet which was inspected.
+            let new_read_buffer = queue.prepare_send(from_buffer)
+                .zip(buffer.iter_mut())
+                .enumerate()
+                .try_fold(None, |previous, indexed|
+            {
+                let (enumerated, (RxEntry { index, descriptor, buf_in_use, pool }, packet)) = indexed;
+
+                let status = unsafe {
+                    ptr::read_volatile(&mut (*descriptor).wb.upper.status_error as *mut u32) 
+                };
+
+                if (status & IXGBE_RXDADV_STAT_DD) == 0 {
+                    return Err(previous);
+                }
+
+                if (status & IXGBE_RXDADV_STAT_EOP) == 0 {
+                    panic!("increase buffer size or decrease MTU")
+                }
+
+                // replace currently used packet with packet from the queue
+                let addr_phys = packet.addr_phys;
+                mem::swap(buf_in_use, &mut packet.pool_entry);
+                unsafe {
+                    packet.addr_virt = pool.get_virt_addr(packet.pool_entry);
+                    packet.addr_phys = pool.get_phys_addr(packet.pool_entry);
+                    packet.len =  ptr::read_volatile(
+                        &(*descriptor).wb.upper.length as *const u16) as usize;
+                }
+
+                unsafe {
+                    ptr::write_volatile(
+                        &mut (*descriptor).read.pkt_addr as *mut u64,
+                        addr_phys as u64,
+                    );
+                    ptr::write_volatile(&mut (*descriptor).read.hdr_addr as *mut u64, 0);
+                }
+
+                Ok(Some((enumerated + 1, index)))
+            });
+
+            // Error was used for loop termination, still holds the required value.
+            new_queue_state = new_read_buffer
+                .unwrap_or_else(|new| new)
+                .map(|(read, queue_index)| {
+                    let rx_index = wrap_ring(queue_index, queue.num_descriptors);
+                    (read, rx_index, queue_index)
+                });
+        }
+
+        let read_buff;
+
+        if let Some((read, rx_index, queue_index)) = new_queue_state {
+            self.set_reg32(IXGBE_RDT(queue_id), queue_index as u32);
+            self.rx_queues[queue_id as usize].rx_index = rx_index;
+
+            // Rearrange the buffer, reads needs to be last. No other packets, no shuffling
+            if read > 0 && read < buffer.len() {
+                (0..read).for_each(|_| {
+                    let t = buffer.pop_front().unwrap();
+                    buffer.push_back(t);
+                });
+            }
+
+            read_buff = read;
+        } else {
+            read_buff = 0;
+        }
+
+        // read the remaning packets from the pool
+        let read_pool = if read_buff == from_buffer && from_pool > 0 {
+            self.rx_batch(queue_id, buffer, from_pool)
+        } else {
+            0
+        };
+
+        read_buff + read_pool
     }
 
     /// Pops as many packets as possible from `packets` to put them into the device`s tx queue.
@@ -751,6 +869,41 @@ impl IxgbeDevice {
             }
             thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+impl IxgbeRxQueue {
+    /// Get an iterator of the next `num` send buffer descriptors.
+    ///
+    /// The amount of request `num` is limited by the total number of available buffers in the send
+    /// queue of the card.
+    fn prepare_send<'a>(&'a mut self, num: usize)
+        -> impl Iterator<Item=RxEntry<'a>> + 'a
+    {
+        let num = num.min(self.num_descriptors);
+        let rx_index = self.rx_index;
+        let descriptors = self.descriptors;
+        let pool = &self.pool;
+
+        let (first, second) = self.bufs_in_use.split_at_mut(self.rx_index);
+        let (flen, slen) = split_ring(self.rx_index, num, self.num_descriptors);
+
+        let (first, second) = (&mut first[..flen], &mut second[..slen]);
+        let first = first.iter_mut().enumerate().map(move |(num, buf_in_use)| RxEntry {
+            index: rx_index + num,
+            descriptor: unsafe { std::mem::transmute(descriptors.add(rx_index + num)) },
+            buf_in_use,
+            pool,
+        });
+
+        let second = second.iter_mut().enumerate().map(move |(num, buf_in_use)| RxEntry {
+            index: num,
+            descriptor: unsafe { std::mem::transmute(descriptors.add(rx_index + num)) },
+            buf_in_use,
+            pool,
+        });
+
+        first.chain(second)
     }
 }
 

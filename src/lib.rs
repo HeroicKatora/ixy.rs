@@ -65,6 +65,41 @@ pub trait IxyDevice {
         num_packets: usize,
     ) -> usize;
 
+    /// Trade up to `num_packets` `Packet`s from `buffer` for newly received packets.
+    ///
+    /// Returns the number of received packets. While similar to `rx_batch`, this gets around ever
+    /// using the memory pool, instead allocating the from the packets in the input deque. Make
+    /// sure to have consumed the first `num_packets` before calling this.
+    ///
+    /// The default implementation still allocates packets from the pool but takes over the
+    /// convenience of recycling the head of the deque for the caller.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use ixy::*;
+    /// use ixy::memory::Packet;
+    /// use std::collections::VecDeque;
+    ///
+    /// let mut dev = ixy_init("0000:01:00.0", 1, 1).unwrap();
+    /// let mut buf: VecDeque<Packet> = VecDeque::new();
+    ///
+    /// dev.rx_batch(0, &mut buf, 32);
+    /// ```
+    fn rx_trade(
+        &mut self,
+        queue_id: u32,
+        buffer: &mut VecDeque<Packet>,
+        num_packets: usize,
+    ) -> usize {
+        // maximum packets we can drop after receiving
+        let in_len = buffer.len();
+        let count = self.rx_batch(queue_id, buffer, num_packets);
+        let from_queue = in_len.min(count);
+        buffer.drain(0..from_queue).for_each(drop);
+        count
+    }
+
     /// Takes `Packet`s out of `buffer` until `buffer` is empty or the network card's tx
     /// queue is full. Returns the number of sent packets.
     ///
