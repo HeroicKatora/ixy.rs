@@ -352,12 +352,9 @@ impl IxyDevice for IxgbeDevice {
             self.set_reg32(IXGBE_RDT(queue_id), queue_index as u32);
             self.rx_queues[queue_id as usize].rx_index = rx_index;
 
-            // Rearrange the buffer, reads needs to be last. No other packets, no shuffling
+            // Rearrange the buffer, reads needs to be last. Drop all other packets.
             if read > 0 && read < buffer.len() {
-                (0..read).for_each(|_| {
-                    let t = buffer.pop_front().unwrap();
-                    buffer.push_back(t);
-                });
+                buffer.truncate(read);
             }
 
             read_buff = read;

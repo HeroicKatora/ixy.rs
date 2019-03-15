@@ -86,7 +86,7 @@ fn forward(
     tx_dev: &mut IxyDevice,
     tx_queue: u32,
 ) {
-    let num_rx = rx_dev.rx_batch(rx_queue, buffer, BATCH_SIZE);
+    let num_rx = rx_dev.rx_trade(rx_queue, buffer, BATCH_SIZE);
 
     if num_rx > 0 {
         // touch all packets for a realistic workload
@@ -95,8 +95,5 @@ fn forward(
         }
 
         tx_dev.tx_batch(tx_queue, buffer);
-
-        // drop packets if they haven't been sent out
-        buffer.drain(..);
     }
 }

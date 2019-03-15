@@ -65,11 +65,12 @@ pub trait IxyDevice {
         num_packets: usize,
     ) -> usize;
 
-    /// Trade up to `num_packets` `Packet`s from `buffer` for newly received packets.
+    /// Refill the buffer with up to `num_packets`, utilizing any remaining packets.
     ///
-    /// Returns the number of received packets. While similar to `rx_batch`, this gets around ever
-    /// using the memory pool, instead allocating the from the packets in the input deque. Make
-    /// sure to have consumed the first `num_packets` before calling this.
+    /// All packets in the buffer after this operation are newly read packets. While similar to
+    /// `rx_batch`, this gets around ever using the memory pool, instead allocating the from the
+    /// packets in the input deque. Use it when you'd call `buffer.clear` before `tx_batch`.
+    /// Returns the number of received packets.
     ///
     /// The default implementation still allocates packets from the pool but takes over the
     /// convenience of recycling the head of the deque for the caller.
@@ -84,7 +85,10 @@ pub trait IxyDevice {
     /// let mut dev = ixy_init("0000:01:00.0", 1, 1).unwrap();
     /// let mut buf: VecDeque<Packet> = VecDeque::new();
     ///
-    /// dev.rx_batch(0, &mut buf, 32);
+    /// loop {
+    ///     dev.rx_trade(0, &mut buf, 32);
+    ///     buf.iter().for_each(|new_packet| ());
+    /// }
     /// ```
     fn rx_trade(
         &mut self,
@@ -92,12 +96,8 @@ pub trait IxyDevice {
         buffer: &mut VecDeque<Packet>,
         num_packets: usize,
     ) -> usize {
-        // maximum packets we can drop after receiving
-        let in_len = buffer.len();
-        let count = self.rx_batch(queue_id, buffer, num_packets);
-        let from_queue = in_len.min(count);
-        buffer.drain(0..from_queue).for_each(drop);
-        count
+        buffer.clear();
+        self.rx_batch(queue_id, buffer, num_packets)
     }
 
     /// Takes `Packet`s out of `buffer` until `buffer` is empty or the network card's tx
