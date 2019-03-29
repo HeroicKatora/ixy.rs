@@ -882,7 +882,7 @@ impl IxgbeRxQueue {
         let descriptors = self.descriptors;
         let pool = &self.pool;
 
-        let (first, second) = self.bufs_in_use.split_at_mut(self.rx_index);
+        let (second, first) = self.bufs_in_use.split_at_mut(self.rx_index);
         let (flen, slen) = split_ring(self.rx_index, num, self.num_descriptors);
 
         let (first, second) = (&mut first[..flen], &mut second[..slen]);
