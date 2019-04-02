@@ -219,7 +219,8 @@ impl IxyDevice for IxgbeDevice {
 
             // Try to iterate over all possible packet, until one fails. Record the index of the
             // last packet which was inspected.
-            let new_read_buffer = queue.prepare_send(num_packets).try_fold(None, |previous, entry| {
+	    let mut new_read_buffer = None;
+            for entry in queue.prepare_send(num_packets) {
                 let RxEntry { index, descriptor, buf_in_use, pool } = entry;
 
                 let status = unsafe {
@@ -227,7 +228,7 @@ impl IxyDevice for IxgbeDevice {
                 };
 
                 if (status & IXGBE_RXDADV_STAT_DD) == 0 {
-                    return Err(previous);
+		    break;
                 }
 
                 if (status & IXGBE_RXDADV_STAT_EOP) == 0 {
@@ -261,12 +262,11 @@ impl IxyDevice for IxgbeDevice {
                     ptr::write_volatile(&mut (*descriptor).read.hdr_addr as *mut u64, 0);
                 }
 
-                Ok(Some(index))
-            });
+                new_read_buffer = Some(index);
+            };
 
             // Error was used for loop termination, still holds the required value.
             new_queue_state = new_read_buffer
-                .unwrap_or_else(|new| new)
                 .map(|queue_index| {
                     let rx_index = wrap_ring(queue_index, queue.num_descriptors);
                     (rx_index, queue_index)
@@ -297,19 +297,17 @@ impl IxyDevice for IxgbeDevice {
 
             // Try to iterate over all possible packet, until one fails. Record the index of the
             // last packet which was inspected.
-            let new_read_buffer = queue.prepare_send(from_buffer)
+            let mut new_read_buffer = None;
+	    let packets = queue.prepare_send(from_buffer)
                 .zip(buffer.iter_mut())
-                .enumerate()
-                .try_fold(None, |previous, indexed|
-            {
-                let (enumerated, (RxEntry { index, descriptor, buf_in_use, pool }, packet)) = indexed;
-
+                .enumerate();
+            for (enumerated, (RxEntry { index, descriptor, buf_in_use, pool }, packet)) in packets {
                 let status = unsafe {
                     ptr::read_volatile(&mut (*descriptor).wb.upper.status_error as *mut u32) 
                 };
 
                 if (status & IXGBE_RXDADV_STAT_DD) == 0 {
-                    return Err(previous);
+		    break;
                 }
 
                 if (status & IXGBE_RXDADV_STAT_EOP) == 0 {
@@ -334,12 +332,11 @@ impl IxyDevice for IxgbeDevice {
                     ptr::write_volatile(&mut (*descriptor).read.hdr_addr as *mut u64, 0);
                 }
 
-                Ok(Some((enumerated + 1, index)))
-            });
+                new_read_buffer = Some((enumerated + 1, index));
+            };
 
             // Error was used for loop termination, still holds the required value.
             new_queue_state = new_read_buffer
-                .unwrap_or_else(|new| new)
                 .map(|(read, queue_index)| {
                     let rx_index = wrap_ring(queue_index, queue.num_descriptors);
                     (read, rx_index, queue_index)
