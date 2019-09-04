@@ -238,7 +238,7 @@ impl Packet {
             self.truncate(len)
         }
 
-        if self.pool.entry_size > len {
+        if self.pool.entry_size < len {
             return Err(self.pool.entry_size);
         }
 
@@ -247,7 +247,7 @@ impl Packet {
             ptr::write_bytes(start, bytes, len - self.len);
         }
 
-        self.len = self.pool.entry_size;
+        self.len = len;
         Ok(())
     }
 
