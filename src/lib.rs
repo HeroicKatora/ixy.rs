@@ -22,6 +22,7 @@ use self::pci::*;
 
 use std::collections::VecDeque;
 use std::error::Error;
+use std::rc::Rc;
 use std::os::unix::io::RawFd;
 
 const MAX_QUEUES: u16 = 64;
@@ -89,6 +90,10 @@ pub trait IxyDevice {
     /// assert_eq!(dev.tx_batch(0, &mut buf), 0);
     /// ```
     fn tx_batch(&mut self, queue_id: u32, buffer: &mut VecDeque<Packet>) -> usize;
+
+    /// Get the `Mempool` associated with a receive queue, which can then be used to allocate
+    /// packets destined for another outgoing queue.
+    fn recv_pool(&self, queue_id: u32) -> Option<&Rc<Mempool>>;
 
     /// Reads the network card's stats registers into `stats`.
     ///
@@ -242,6 +247,10 @@ impl IxyDevice for Box<dyn IxyDevice> {
 
     fn tx_batch(&mut self, queue_id: u32, buffer: &mut VecDeque<Packet>) -> usize {
         (**self).tx_batch(queue_id, buffer)
+    }
+
+    fn recv_pool(&self, queue_id: u32) -> Option<&Rc<Mempool>> {
+        (**self).recv_pool(queue_id)
     }
 
     fn read_stats(&self, stats: &mut DeviceStats) {

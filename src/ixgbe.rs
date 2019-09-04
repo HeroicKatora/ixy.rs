@@ -319,6 +319,10 @@ impl IxyDevice for IxgbeDevice {
         sent
     }
 
+    fn recv_pool(&self, queue_id: u32) -> Option<&Rc<Mempool>> {
+        self.rx_queues.get(queue_id as usize).map(|queue| &queue.pool)
+    }
+
     /// Reads the stats of this device into `stats`.
     fn read_stats(&self, stats: &mut DeviceStats) {
         let rx_pkts = u64::from(self.get_reg32(IXGBE_GPRC));
