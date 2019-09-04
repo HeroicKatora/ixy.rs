@@ -229,6 +229,36 @@ impl Packet {
         // Validity invariant: the referred to memory range is a proper subset of the previous one.
         self.len = self.len.min(len)
     }
+
+    /// Try to set the length.
+    ///
+    /// New bytes will be initialized as indicated.
+    pub fn try_resize(&mut self, len: usize, bytes: u8) -> Result<(), usize> {
+        if self.len > len {
+            self.truncate(len)
+        }
+
+        if self.pool.entry_size > len {
+            return Err(self.pool.entry_size);
+        }
+
+        unsafe {
+            let start = self.addr_virt.add(self.len);
+            ptr::write_bytes(start, bytes, len - self.len);
+        }
+
+        self.len = self.pool.entry_size;
+        Ok(())
+    }
+
+    /// Manually set the current length of this packet.
+    ///
+    /// Safety requirements:
+    /// * `len` must be smaller than the `entry_size` of the pool.
+    /// * The buffer contents must have been initialized.
+    pub unsafe fn set_len(&mut self, len: usize) {
+        self.len = len;
+    }
 }
 
 /// Common representation for prefetch strategies.
